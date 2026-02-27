@@ -1,7 +1,7 @@
 {
   "lookback_hours": 168,
   "dark_db_threshold": -21.0,
-  "min_dark_ratio": 0.001,
+  "min_dark_ratio": 0.002,
 
   "tiles_nx": 3,
   "tiles_ny": 3,
