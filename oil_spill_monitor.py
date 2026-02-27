@@ -170,9 +170,6 @@ def shape_metrics(mask: np.ndarray) -> Dict[str, float]:
     aspect = long_ / short
     fill = float(xs.size) / float(w * h) if (w * h) > 0 else 0.0
 
-    # Confidence (very light):
-    # - very elongated reduces confidence
-    # - very thin reduces confidence
     conf = 0.75
     if aspect > 10: conf -= 0.35
     elif aspect > 6: conf -= 0.20
@@ -232,7 +229,8 @@ def ops_card(
         f"• النتيجة: {shape_hint}\n"
         f"• الثقة: {conf_pct}%\n"
         f"• الاستطالة: {aspect:.1f} | الامتلاء: {fill:.2f}\n\n"
-        f"🔎 التغطية: مشاهد={scenes_found} | طلبات Process={process_requests}\n"
+        # ✅ الاسم تغيّر هنا فقط
+        f"🔎 بيانات التحليل: مشاهد={scenes_found} | تحليل={process_requests}\n"
         f"🧾 الوضع: {mode_note}\n"
         "════════════════════\n"
         "🎯 الإجراء:\n"
@@ -295,7 +293,6 @@ def main():
         process_errors = 0
         last_error = ""
 
-        # Stable load: 3 scenes x tiles
         for feat in scenes[:3]:
             scene_time = (feat.get("properties", {}) or {}).get("datetime")
             if not scene_time:
@@ -327,7 +324,6 @@ def main():
                     conf = float(m["conf"])
                     conf_pct = int(round(conf * 100))
 
-                    # Score = dark_ratio + light confidence (never blocks)
                     base = (dark_ratio / max(min_dark_ratio, 1e-6)) * 60 + 20
                     score = int(clamp(base * (0.70 + 0.30 * conf), 10, 95))
 
@@ -364,7 +360,6 @@ def main():
         if best:
             best_candidates.append(best)
 
-    # Always send something:
     if not best_candidates:
         send_telegram(bot, chat_id, diag_msg(ksa_time, lookback, diag_lines))
         send_telegram(bot, chat_id, "✅ لا توجد مرشحات قابلة للتحليل اليوم (أو تغطية ضعيفة).")
