@@ -1,19 +1,5 @@
 {
-  "lookback_hours": 72,
-  "min_dark_ratio": 0.07,
-  "dark_db_threshold": -23.0,
-  "cooldown_hours_per_area": 12,
-  "max_alerts_per_run": 4,
-  "areas": [
-    {
-      "id": "red_sea",
-      "name_ar": "البحر الأحمر",
-      "bbox": [32.0, 12.0, 44.5, 29.5]
-    },
-    {
-      "id": "arabian_gulf",
-      "name_ar": "الخليج العربي",
-      "bbox": [47.0, 23.0, 57.5, 30.8]
-    }
-  ]
+  "lookback_hours": 168,
+  "min_dark_ratio": 0.04,
+  "dark_db_threshold": -21.0
 }
