@@ -74,7 +74,7 @@ def get_token(client_id: str, client_secret: str) -> str:
 # ---------------- Sentinel Hub: Catalog ----------------
 def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt.datetime, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    No sortby (to avoid 400 Bad Request in some CDSE setups).
+    No sortby (avoid 400 in some CDSE setups).
     """
     headers = {"Authorization": f"Bearer {token}"}
     body = {
@@ -89,10 +89,12 @@ def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt
     return r.json().get("features", [])
 
 
-# ---------------- Sentinel Hub: Process API ----------------
+# ---------------- Sentinel Hub: Process API (SAFE MODE) ----------------
 def process_vv_db_thumbnail(token: str, bbox: List[float], time_from: dt.datetime, time_to: dt.datetime, w: int = 256, h: int = 256) -> np.ndarray:
     """
-    Fetch VV backscatter in dB (thumbnail). Returns 2D float array with NaNs for nodata.
+    SAFE MODE:
+    - Do NOT set polarization/acquisitionMode/speckleFilter to avoid silent failures on some accounts.
+    - Returns VV in dB + dataMask in a TIFF, converted to 2D db array with NaNs for nodata.
     """
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -120,9 +122,6 @@ function evaluatePixel(s) {
                 "type": "sentinel-1-grd",
                 "dataFilter": {
                     "timeRange": {"from": iso_z(time_from), "to": iso_z(time_to)}
-                },
-                "processing": {
-                    "speckleFilter": {"type": "LEE", "windowSizeX": 3, "windowSizeY": 3}
                 }
             }]
         },
@@ -140,7 +139,6 @@ function evaluatePixel(s) {
     img = Image.open(BytesIO(r.content))
     arr = np.array(img)
 
-    # Expected: HxWx2 (db + mask)
     if arr.ndim < 3 or arr.shape[-1] < 2:
         raise RuntimeError("Unexpected TIFF format from Process API")
 
@@ -152,10 +150,6 @@ function evaluatePixel(s) {
 
 # ---------------- Detection + Geolocation ----------------
 def centroid_latlon(bbox: List[float], mask: np.ndarray) -> Optional[Tuple[float, float]]:
-    """
-    Convert centroid of True pixels into lat/lon using bbox mapping.
-    bbox = [minLon, minLat, maxLon, maxLat]
-    """
     ys, xs = np.where(mask)
     if xs.size < 20:
         return None
@@ -208,18 +202,16 @@ def diagnostic_report(ksa_time: str, lookback_hours: int, diag_lines: List[str])
         "════════════════════\n"
         f"⏱️ نطاق البحث: آخر {lookback_hours} ساعة\n\n"
         + "\n".join(diag_lines) +
-        "\n\n✅ النظام يعمل، لكن لم يتم استخراج مرشح (قد يكون بسبب فشل Process API لبعض المشاهد)."
+        "\n\n✅ النظام يعمل، لكن لم يتم استخراج مرشح (قد يكون Process API يفشل لبعض المشاهد)."
     )
 
 
 def main():
-    # Secrets
     client_id = os.environ["CDSE_CLIENT_ID"]
     client_secret = os.environ["CDSE_CLIENT_SECRET"]
     bot = os.environ["TELEGRAM_BOT_TOKEN"]
     chat_id = os.environ["TELEGRAM_CHAT_ID"]
 
-    # Config
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         cfg = json.load(f)
 
@@ -234,10 +226,10 @@ def main():
     ksa_time = fmt_ksa(now)
 
     token = get_token(client_id, client_secret)
+
     state = load_state()
     area_state = state.get("areas", {})
 
-    # Collect best candidate per area
     best_candidates: List[Dict[str, Any]] = []
     diag_lines: List[str] = []
 
@@ -246,7 +238,7 @@ def main():
         area_name = area["name_ar"]
         bbox = area["bbox"]
 
-        # cooldown check
+        # cooldown
         last_alert = area_state.get(area_id, {}).get("last_alert_utc")
         in_cooldown = False
         if last_alert:
@@ -262,10 +254,10 @@ def main():
         best = None
 
         if scenes_found == 0:
-            diag_lines.append(f"• {area_name}: مشاهد=0 (تحقق من bbox أو الفترة)")
+            diag_lines.append(f"• {area_name}: مشاهد=0")
             continue
 
-        # Try up to 8 scenes
+        # Try newest-ish scenes (first 8)
         for feat in scenes[:8]:
             scene_time = (feat.get("properties", {}) or {}).get("datetime")
             if not scene_time:
@@ -291,7 +283,6 @@ def main():
                     continue
                 lat, lon = c
 
-                # Score mapping (practical)
                 score = int(min(95, max(10, (dark_ratio / max(min_dark_ratio, 1e-6)) * 60 + 20)))
 
                 cand = {
@@ -311,7 +302,6 @@ def main():
                     best = cand
 
             except Exception:
-                # skip failed scenes
                 continue
 
         diag_lines.append(f"• {area_name}: مشاهد={scenes_found} | تم تحليل={scenes_processed}")
@@ -319,55 +309,56 @@ def main():
         if best:
             best_candidates.append(best)
 
-    # Sort across areas by strength
     best_candidates.sort(key=lambda x: x["dark_ratio"], reverse=True)
 
     sent_any = 0
 
-    # Send real alerts (>= min_dark_ratio) up to max_alerts
+    # Real alerts first
     for cand in best_candidates:
         if sent_any >= max_alerts:
             break
 
-        # cooldown: only allow very high
         if cand["in_cooldown"] and cand["score"] < 85:
             continue
 
         if cand["dark_ratio"] >= min_dark_ratio:
-            msg = ops_card(
-                cand["area_name"], ksa_time, cand["scene_utc"], cand["lat"], cand["lon"],
-                cand["dark_ratio"], thr_db, cand["score"],
-                "🚨 Alert Mode (تجاوز العتبة)",
-                cand["scenes_found"], cand["scenes_processed"]
+            send_telegram(
+                bot, chat_id,
+                ops_card(
+                    cand["area_name"], ksa_time, cand["scene_utc"],
+                    cand["lat"], cand["lon"], cand["dark_ratio"], thr_db, cand["score"],
+                    "🚨 Alert Mode (تجاوز العتبة)",
+                    cand["scenes_found"], cand["scenes_processed"]
+                )
             )
-            send_telegram(bot, chat_id, msg)
             sent_any += 1
             time.sleep(1.2)
 
             area_state.setdefault(cand["area_id"], {})
             area_state[cand["area_id"]]["last_alert_utc"] = iso_z(now)
 
-    # If no real alerts, send ONE best candidate as Analyst Mode (even if weak)
+    # If no real alerts, ALWAYS send the best candidate (Analyst)
     if sent_any == 0 and best_candidates:
         cand = best_candidates[0]
-        msg = ops_card(
-            cand["area_name"], ksa_time, cand["scene_utc"], cand["lat"], cand["lon"],
-            cand["dark_ratio"], thr_db, cand["score"],
-            "📡 Analyst Mode (أفضل مرشح – قد يكون Look-alike)",
-            cand["scenes_found"], cand["scenes_processed"]
+        send_telegram(
+            bot, chat_id,
+            ops_card(
+                cand["area_name"], ksa_time, cand["scene_utc"],
+                cand["lat"], cand["lon"], cand["dark_ratio"], thr_db, cand["score"],
+                "📡 Analyst Mode (أفضل مرشح – قد يكون Look-alike)",
+                cand["scenes_found"], cand["scenes_processed"]
+            )
         )
-        send_telegram(bot, chat_id, msg)
         sent_any = 1
 
-    # If no candidates at all (e.g., Process failed), send diagnostic report
+    # If no candidates at all, send diagnostic
     if not best_candidates:
         send_telegram(bot, chat_id, diagnostic_report(ksa_time, lookback, diag_lines))
 
-    # If still nothing sent for any reason, send status
+    # If somehow nothing sent, send status
     if sent_any == 0:
         send_telegram(bot, chat_id, status_report(ksa_time, lookback))
 
-    # Save state
     state["areas"] = area_state
     save_state(state)
 
