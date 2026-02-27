@@ -16,7 +16,6 @@ PROCESS_API = f"{BASE_URL}/api/v1/process"
 
 CONFIG_FILE = "config.json"
 STATE_FILE = "state.json"
-
 KSA_TZ = tz.gettz("Asia/Riyadh")
 
 
@@ -32,7 +31,11 @@ def fmt_ksa(d_utc: dt.datetime) -> str:
 
 def send_telegram(bot: str, chat_id: str, text: str) -> None:
     url = f"https://api.telegram.org/bot{bot}/sendMessage"
-    r = requests.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True}, timeout=30)
+    r = requests.post(
+        url,
+        json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+        timeout=30
+    )
     r.raise_for_status()
 
 def risk_badge(score: int) -> str:
@@ -57,8 +60,12 @@ def save_state(state: Dict[str, Any]) -> None:
 def get_token(client_id: str, client_secret: str) -> str:
     r = requests.post(
         TOKEN_URL,
-        data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
-        timeout=30,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": client_id,
+            "client_secret": client_secret
+        },
+        timeout=30
     )
     r.raise_for_status()
     return r.json()["access_token"]
@@ -67,7 +74,7 @@ def get_token(client_id: str, client_secret: str) -> str:
 # ---------------- Sentinel Hub: Catalog ----------------
 def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt.datetime, limit: int = 20) -> List[Dict[str, Any]]:
     """
-    NOTE: No 'sortby' here because CDSE may return 400 for it in some setups.
+    No sortby (to avoid 400 Bad Request in some CDSE setups).
     """
     headers = {"Authorization": f"Bearer {token}"}
     body = {
@@ -85,7 +92,7 @@ def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt
 # ---------------- Sentinel Hub: Process API ----------------
 def process_vv_db_thumbnail(token: str, bbox: List[float], time_from: dt.datetime, time_to: dt.datetime, w: int = 256, h: int = 256) -> np.ndarray:
     """
-    Fetch VV backscatter (dB) thumbnail using Process API. Returns 2D float with NaNs for nodata.
+    Fetch VV backscatter in dB (thumbnail). Returns 2D float array with NaNs for nodata.
     """
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -112,9 +119,7 @@ function evaluatePixel(s) {
             "data": [{
                 "type": "sentinel-1-grd",
                 "dataFilter": {
-                    "timeRange": {"from": iso_z(time_from), "to": iso_z(time_to)},
-                    "acquisitionMode": "IW",
-                    "polarization": "VV"
+                    "timeRange": {"from": iso_z(time_from), "to": iso_z(time_to)}
                 },
                 "processing": {
                     "speckleFilter": {"type": "LEE", "windowSizeX": 3, "windowSizeY": 3}
@@ -134,12 +139,14 @@ function evaluatePixel(s) {
 
     img = Image.open(BytesIO(r.content))
     arr = np.array(img)
+
+    # Expected: HxWx2 (db + mask)
     if arr.ndim < 3 or arr.shape[-1] < 2:
-        raise RuntimeError("Unexpected TIFF returned from Process API")
+        raise RuntimeError("Unexpected TIFF format from Process API")
 
     db = arr[..., 0].astype(np.float32)
-    mask = arr[..., 1].astype(np.float32)
-    db[mask < 0.5] = np.nan
+    m = arr[..., 1].astype(np.float32)
+    db[m < 0.5] = np.nan
     return db
 
 
@@ -148,7 +155,6 @@ def centroid_latlon(bbox: List[float], mask: np.ndarray) -> Optional[Tuple[float
     """
     Convert centroid of True pixels into lat/lon using bbox mapping.
     bbox = [minLon, minLat, maxLon, maxLat]
-    mask shape = (H, W)
     """
     ys, xs = np.where(mask)
     if xs.size < 20:
@@ -164,20 +170,21 @@ def centroid_latlon(bbox: List[float], mask: np.ndarray) -> Optional[Tuple[float
     return (lat, lon)
 
 def ops_card(area_name: str, ksa_time: str, scene_utc: str, lat: float, lon: float,
-             dark_ratio: float, thr_db: float, score: int, note: str) -> str:
+             dark_ratio: float, thr_db: float, score: int, mode_note: str,
+             scenes_found: int, scenes_processed: int) -> str:
     return (
         "🚨 بطاقة عمليات بيئية – رصد انسكابات (SAR)\n"
         "════════════════════\n"
-        "🛢️ الحدث: أفضل مرشح بقعة داكنة\n"
         f"📍 المنطقة: {area_name}\n"
         f"🌍 الإحداثيات: {lat:.4f}N , {lon:.4f}E\n"
         f"🕒 وقت التحديث: {ksa_time}\n\n"
         f"📊 مستوى الخطر: {risk_badge(score)} ({score}/100)\n\n"
         "🛰️ تحليل Sentinel-1 (VV)\n"
         f"• مؤشر البقعة الداكنة: {dark_ratio:.2%}\n"
-        f"• العتبة (dB): أقل من {thr_db}\n"
+        f"• عتبة البقع الداكنة (dB): أقل من {thr_db}\n"
         f"• وقت المشهد (UTC): {scene_utc}\n\n"
-        f"🧾 ملاحظة: {note}\n"
+        f"🔎 التغطية: مشاهد موجودة={scenes_found} | تم تحليل={scenes_processed}\n"
+        f"🧾 الوضع: {mode_note}\n"
         "════════════════════\n"
         "🎯 الإجراء:\n"
         "• متابعة التمريرة القادمة لنفس المنطقة.\n"
@@ -192,6 +199,16 @@ def status_report(ksa_time: str, lookback_hours: int) -> str:
         "📍 المناطق: البحر الأحمر + الخليج العربي\n"
         "🛰️ المصدر: Sentinel-1 (SAR)\n\n"
         f"✅ لا توجد بقع تجاوزت عتبة التنبيه خلال آخر {lookback_hours} ساعة.\n"
+    )
+
+def diagnostic_report(ksa_time: str, lookback_hours: int, diag_lines: List[str]) -> str:
+    return (
+        "📄 تقرير تشخيص رصد الانسكابات (SAR)\n"
+        f"🕒 {ksa_time}\n"
+        "════════════════════\n"
+        f"⏱️ نطاق البحث: آخر {lookback_hours} ساعة\n\n"
+        + "\n".join(diag_lines) +
+        "\n\n✅ النظام يعمل، لكن لم يتم استخراج مرشح (قد يكون بسبب فشل Process API لبعض المشاهد)."
     )
 
 
@@ -220,8 +237,9 @@ def main():
     state = load_state()
     area_state = state.get("areas", {})
 
+    # Collect best candidate per area
     best_candidates: List[Dict[str, Any]] = []
-    sent_any = 0
+    diag_lines: List[str] = []
 
     for area in cfg["areas"]:
         area_id = area["id"]
@@ -239,12 +257,15 @@ def main():
                 pass
 
         scenes = catalog_search_s1(token, bbox, start, now, limit=20)
-        if not scenes:
-            continue
-
+        scenes_found = len(scenes)
+        scenes_processed = 0
         best = None
 
-        # evaluate a few scenes (newest-ish)
+        if scenes_found == 0:
+            diag_lines.append(f"• {area_name}: مشاهد=0 (تحقق من bbox أو الفترة)")
+            continue
+
+        # Try up to 8 scenes
         for feat in scenes[:8]:
             scene_time = (feat.get("properties", {}) or {}).get("datetime")
             if not scene_time:
@@ -256,6 +277,8 @@ def main():
 
             try:
                 db = process_vv_db_thumbnail(token, bbox, t_from, t_to)
+                scenes_processed += 1
+
                 valid = np.isfinite(db)
                 if valid.sum() < 1000:
                     continue
@@ -268,6 +291,7 @@ def main():
                     continue
                 lat, lon = c
 
+                # Score mapping (practical)
                 score = int(min(95, max(10, (dark_ratio / max(min_dark_ratio, 1e-6)) * 60 + 20)))
 
                 cand = {
@@ -278,31 +302,43 @@ def main():
                     "lon": lon,
                     "dark_ratio": dark_ratio,
                     "score": score,
-                    "in_cooldown": in_cooldown
+                    "in_cooldown": in_cooldown,
+                    "scenes_found": scenes_found,
+                    "scenes_processed": scenes_processed
                 }
 
                 if (best is None) or (cand["dark_ratio"] > best["dark_ratio"]):
                     best = cand
 
             except Exception:
+                # skip failed scenes
                 continue
+
+        diag_lines.append(f"• {area_name}: مشاهد={scenes_found} | تم تحليل={scenes_processed}")
 
         if best:
             best_candidates.append(best)
 
+    # Sort across areas by strength
     best_candidates.sort(key=lambda x: x["dark_ratio"], reverse=True)
 
-    # Send "real alerts" (>= min_dark_ratio)
-    for cand in best_candidates[:max_alerts]:
+    sent_any = 0
+
+    # Send real alerts (>= min_dark_ratio) up to max_alerts
+    for cand in best_candidates:
+        if sent_any >= max_alerts:
+            break
+
+        # cooldown: only allow very high
         if cand["in_cooldown"] and cand["score"] < 85:
             continue
 
         if cand["dark_ratio"] >= min_dark_ratio:
             msg = ops_card(
-                cand["area_name"], ksa_time, cand["scene_utc"],
-                cand["lat"], cand["lon"],
+                cand["area_name"], ksa_time, cand["scene_utc"], cand["lat"], cand["lon"],
                 cand["dark_ratio"], thr_db, cand["score"],
-                "تم إرسال تنبيه لأن المؤشر تجاوز عتبة المرشح."
+                "🚨 Alert Mode (تجاوز العتبة)",
+                cand["scenes_found"], cand["scenes_processed"]
             )
             send_telegram(bot, chat_id, msg)
             sent_any += 1
@@ -311,20 +347,27 @@ def main():
             area_state.setdefault(cand["area_id"], {})
             area_state[cand["area_id"]]["last_alert_utc"] = iso_z(now)
 
-    # If no real alerts, send 1 best candidate (Analyst)
+    # If no real alerts, send ONE best candidate as Analyst Mode (even if weak)
     if sent_any == 0 and best_candidates:
         cand = best_candidates[0]
         msg = ops_card(
-            cand["area_name"], ksa_time, cand["scene_utc"],
-            cand["lat"], cand["lon"],
+            cand["area_name"], ksa_time, cand["scene_utc"], cand["lat"], cand["lon"],
             cand["dark_ratio"], thr_db, cand["score"],
-            "مرشح تحليلي (أعلى بقعة داكنة). قد تكون Look-alike وليست زيت."
+            "📡 Analyst Mode (أفضل مرشح – قد يكون Look-alike)",
+            cand["scenes_found"], cand["scenes_processed"]
         )
         send_telegram(bot, chat_id, msg)
+        sent_any = 1
 
+    # If no candidates at all (e.g., Process failed), send diagnostic report
     if not best_candidates:
+        send_telegram(bot, chat_id, diagnostic_report(ksa_time, lookback, diag_lines))
+
+    # If still nothing sent for any reason, send status
+    if sent_any == 0:
         send_telegram(bot, chat_id, status_report(ksa_time, lookback))
 
+    # Save state
     state["areas"] = area_state
     save_state(state)
 
