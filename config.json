@@ -1,6 +1,6 @@
 {
   "lookback_hours": 168,
-  "min_dark_ratio": 0.04,
+  "min_dark_ratio": 0.001,
   "dark_db_threshold": -21.0,
   "cooldown_hours_per_area": 12,
   "max_alerts_per_run": 4,
