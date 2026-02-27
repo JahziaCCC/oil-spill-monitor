@@ -2,7 +2,14 @@
   "lookback_hours": 168,
   "dark_db_threshold": -21.0,
   "min_dark_ratio": 0.001,
+
+  "tiles_nx": 3,
+  "tiles_ny": 3,
+  "tile_width": 1024,
+  "tile_height": 1024,
+
   "max_alerts_per_run": 1,
+
   "areas": [
     { "id": "red_sea", "name_ar": "البحر الأحمر", "bbox": [32.0, 12.0, 44.5, 29.5] },
     { "id": "arabian_gulf", "name_ar": "الخليج العربي", "bbox": [47.0, 23.0, 57.5, 30.8] }
