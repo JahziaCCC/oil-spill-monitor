@@ -66,9 +66,6 @@ def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt
 
 # ---------------- Process API (PNG MASK) ----------------
 def build_evalscript_mask(thr_db: float) -> str:
-    # نُخرج قناتين:
-    # band1 = mask (0/255) للبقعة الداكنة
-    # band2 = dataMask (0/255) للبكسلات الصحيحة
     return f"""
 //VERSION=3
 function setup() {{
@@ -86,12 +83,7 @@ function evaluatePixel(s) {{
 }}
 """
 
-def process_mask_png(token: str, bbox: List[float], time_from: dt.datetime, time_to: dt.datetime, thr_db: float, w: int = 256, h: int = 256) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    يرجع:
-      dark_mask: bool array (H,W)
-      valid_mask: bool array (H,W)
-    """
+def process_mask_png(token: str, bbox: List[float], time_from: dt.datetime, time_to: dt.datetime, thr_db: float, w: int, h: int) -> Tuple[np.ndarray, np.ndarray]:
     headers = {"Authorization": f"Bearer {token}"}
     evalscript = build_evalscript_mask(thr_db)
 
@@ -117,18 +109,14 @@ def process_mask_png(token: str, bbox: List[float], time_from: dt.datetime, time
     }
 
     r = requests.post(PROCESS_API, headers=headers, json=body, timeout=120)
-
     if r.status_code != 200:
-        # نرمي الخطأ مع تفاصيل نصية (أهم شيء عشان ما يصير تم تحليل=0 بدون سبب)
-        snippet = (r.text or "")[:600]
+        snippet = (r.text or "")[:700]
         raise RuntimeError(f"Process API failed: HTTP {r.status_code}\n{snippet}")
 
     img = Image.open(BytesIO(r.content))
-
-    # PNG بقناتين عادة يكون وضع "LA"
     arr = np.array(img)
+
     if arr.ndim == 2:
-        # لو رجع قناة واحدة فقط (نادر) نعتبرها mask ونفترض valid=all
         dark = arr > 0
         valid = np.ones_like(dark, dtype=bool)
         return dark, valid
@@ -139,6 +127,27 @@ def process_mask_png(token: str, bbox: List[float], time_from: dt.datetime, time
         return dark, valid
 
     raise RuntimeError("Unexpected PNG shape from Process API")
+
+
+# ---------------- Tiling to fix resolution ----------------
+def split_bbox(bbox: List[float], nx: int = 3, ny: int = 3) -> List[List[float]]:
+    """
+    Split bbox into nx * ny smaller bboxes.
+    bbox = [minLon, minLat, maxLon, maxLat]
+    """
+    minLon, minLat, maxLon, maxLat = bbox
+    lons = np.linspace(minLon, maxLon, nx + 1)
+    lats = np.linspace(minLat, maxLat, ny + 1)
+
+    tiles = []
+    for ix in range(nx):
+        for iy in range(ny):
+            t_minLon = float(lons[ix])
+            t_maxLon = float(lons[ix + 1])
+            t_minLat = float(lats[iy])
+            t_maxLat = float(lats[iy + 1])
+            tiles.append([t_minLon, t_minLat, t_maxLon, t_maxLat])
+    return tiles
 
 
 # ---------------- Geolocation ----------------
@@ -212,6 +221,10 @@ def main():
     best_candidates: List[Dict[str, Any]] = []
     diag_lines: List[str] = []
 
+    # Settings: tiles + higher width/height so meters-per-pixel stays under 1500
+    NX, NY = 3, 3
+    W, H = 1024, 1024  # key fix
+
     for area in cfg["areas"]:
         area_name = area["name_ar"]
         bbox = area["bbox"]
@@ -228,86 +241,85 @@ def main():
         process_errors = 0
         last_error_text = ""
 
-        for feat in scenes[:6]:
+        tiles = split_bbox(bbox, NX, NY)
+
+        for feat in scenes[:3]:  # نخفف: 3 مشاهد فقط لتجنب الضغط
             scene_time = (feat.get("properties", {}) or {}).get("datetime")
             if not scene_time:
                 continue
 
             t = dt.datetime.fromisoformat(scene_time.replace("Z", "+00:00"))
-            t_from = t - dt.timedelta(minutes=8)
-            t_to = t + dt.timedelta(minutes=8)
+            t_from = t - dt.timedelta(minutes=10)
+            t_to = t + dt.timedelta(minutes=10)
 
-            try:
-                dark_mask, valid_mask = process_mask_png(token, bbox, t_from, t_to, thr_db, w=256, h=256)
-                scenes_processed += 1
+            # جرّب على كل tile
+            for tbbox in tiles:
+                try:
+                    dark_mask, valid_mask = process_mask_png(token, tbbox, t_from, t_to, thr_db, w=W, h=H)
+                    scenes_processed += 1
 
-                valid_count = int(valid_mask.sum())
-                if valid_count < 500:
+                    valid_count = int(valid_mask.sum())
+                    if valid_count < 500:
+                        continue
+
+                    dark_count = int((dark_mask & valid_mask).sum())
+                    dark_ratio = dark_count / float(valid_count)
+
+                    c = centroid_latlon(tbbox, dark_mask & valid_mask)
+                    if c is None:
+                        continue
+
+                    lat, lon = c
+                    score = int(min(95, max(10, (dark_ratio / max(min_dark_ratio, 1e-6)) * 60 + 20)))
+
+                    cand = {
+                        "area_name": area_name,
+                        "scene_utc": scene_time.replace("Z", ""),
+                        "lat": lat,
+                        "lon": lon,
+                        "dark_ratio": dark_ratio,
+                        "score": score,
+                        "scenes_found": scenes_found,
+                        "scenes_processed": scenes_processed,
+                    }
+
+                    if best is None or cand["dark_ratio"] > best["dark_ratio"]:
+                        best = cand
+
+                except Exception as e:
+                    process_errors += 1
+                    last_error_text = str(e)
                     continue
 
-                dark_count = int((dark_mask & valid_mask).sum())
-                dark_ratio = dark_count / float(valid_count)
+        diag_lines.append(
+            f"• {area_name}: مشاهد={scenes_found} | طلبات Process={scenes_processed} | أخطاء={process_errors}"
+        )
 
-                c = centroid_latlon(bbox, dark_mask & valid_mask)
-                if c is None:
-                    continue
-
-                lat, lon = c
-                score = int(min(95, max(10, (dark_ratio / max(min_dark_ratio, 1e-6)) * 60 + 20)))
-
-                cand = {
-                    "area_name": area_name,
-                    "scene_utc": scene_time.replace("Z", ""),
-                    "lat": lat,
-                    "lon": lon,
-                    "dark_ratio": dark_ratio,
-                    "score": score,
-                    "scenes_found": scenes_found,
-                    "scenes_processed": scenes_processed,
-                }
-
-                if best is None or cand["dark_ratio"] > best["dark_ratio"]:
-                    best = cand
-
-            except Exception as e:
-                process_errors += 1
-                last_error_text = str(e)
-                continue
-
-        diag_lines.append(f"• {area_name}: مشاهد={scenes_found} | تم تحليل={scenes_processed} | أخطاء Process={process_errors}")
-
-        # إذا Process فشل بالكامل في المنطقة، نرسل سبب آخر خطأ (مختصر)
         if scenes_processed == 0 and process_errors > 0:
-            snippet = (last_error_text or "")[:700]
-            diag_lines.append(f"  ↳ آخر خطأ: {snippet}")
+            diag_lines.append(f"  ↳ آخر خطأ: {(last_error_text or '')[:700]}")
 
         if best:
             best_candidates.append(best)
 
-    # لو ما طلع أي مرشح (حتى Analyst)، نرسل تشخيص واضح
     if not best_candidates:
         send_telegram(bot, chat_id, diag_msg(ksa_time, lookback, diag_lines))
         return
 
-    # رتّب الأقوى
     best_candidates.sort(key=lambda x: x["dark_ratio"], reverse=True)
 
-    sent = 0
-    for cand in best_candidates:
-        if sent >= max_alerts:
-            break
-
-        mode_note = "🚨 Alert Mode (تجاوز العتبة)" if cand["dark_ratio"] >= min_dark_ratio else "📡 Analyst Mode (أفضل مرشح – قد يكون Look-alike)"
-        msg = ops_card(
+    # Send best result (alert or analyst)
+    cand = best_candidates[0]
+    mode_note = "🚨 Alert Mode (تجاوز العتبة)" if cand["dark_ratio"] >= min_dark_ratio else "📡 Analyst Mode (أفضل مرشح – قد يكون Look-alike)"
+    send_telegram(
+        bot, chat_id,
+        ops_card(
             cand["area_name"], ksa_time, cand["scene_utc"],
             cand["lat"], cand["lon"], cand["dark_ratio"], thr_db, cand["score"],
             mode_note, cand["scenes_found"], cand["scenes_processed"]
         )
-        send_telegram(bot, chat_id, msg)
-        sent += 1
-        time.sleep(1.0)
+    )
 
-    # أيضًا نرسل سطر تشخيص مختصر للتأكيد
+    # Send diagnostic summary
     send_telegram(bot, chat_id, diag_msg(ksa_time, lookback, diag_lines))
 
 
