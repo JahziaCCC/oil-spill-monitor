@@ -66,6 +66,9 @@ def get_token(client_id: str, client_secret: str) -> str:
 
 # ---------------- Sentinel Hub: Catalog ----------------
 def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt.datetime, limit: int = 20) -> List[Dict[str, Any]]:
+    """
+    NOTE: No 'sortby' here because CDSE may return 400 for it in some setups.
+    """
     headers = {"Authorization": f"Bearer {token}"}
     body = {
         "collections": ["sentinel-1-grd"],
@@ -73,8 +76,6 @@ def catalog_search_s1(token: str, bbox: List[float], start: dt.datetime, end: dt
         "bbox": bbox,
         "limit": limit,
         "fields": {"include": ["id", "properties.datetime"]},
-        # sort newest first (STAC supports sortby in many implementations)
-        "sortby": [{"field": "properties.datetime", "direction": "desc"}],
     }
     r = requests.post(CATALOG_SEARCH, headers=headers, json=body, timeout=60)
     r.raise_for_status()
@@ -191,7 +192,6 @@ def status_report(ksa_time: str, lookback_hours: int) -> str:
         "📍 المناطق: البحر الأحمر + الخليج العربي\n"
         "🛰️ المصدر: Sentinel-1 (SAR)\n\n"
         f"✅ لا توجد بقع تجاوزت عتبة التنبيه خلال آخر {lookback_hours} ساعة.\n"
-        "ℹ️ ملاحظة: النظام ما يزال يرسل “أفضل مرشح” إذا فعّلت وضع المرشح.\n"
     )
 
 
@@ -220,8 +220,6 @@ def main():
     state = load_state()
     area_state = state.get("areas", {})
 
-    # We will compute BEST candidate per area (even if weak),
-    # but only SEND if above min_dark_ratio OR if no alerts at all then send best candidate once.
     best_candidates: List[Dict[str, Any]] = []
     sent_any = 0
 
@@ -230,7 +228,7 @@ def main():
         area_name = area["name_ar"]
         bbox = area["bbox"]
 
-        # cooldown
+        # cooldown check
         last_alert = area_state.get(area_id, {}).get("last_alert_utc")
         in_cooldown = False
         if last_alert:
@@ -244,9 +242,9 @@ def main():
         if not scenes:
             continue
 
-        # Evaluate a few newest scenes and keep the best dark_ratio
         best = None
 
+        # evaluate a few scenes (newest-ish)
         for feat in scenes[:8]:
             scene_time = (feat.get("properties", {}) or {}).get("datetime")
             if not scene_time:
@@ -270,7 +268,6 @@ def main():
                     continue
                 lat, lon = c
 
-                # score (practical mapping)
                 score = int(min(95, max(10, (dark_ratio / max(min_dark_ratio, 1e-6)) * 60 + 20)))
 
                 cand = {
@@ -293,39 +290,41 @@ def main():
         if best:
             best_candidates.append(best)
 
-    # Sort all candidates by strength
     best_candidates.sort(key=lambda x: x["dark_ratio"], reverse=True)
 
-    # Send up to max_alerts only if above threshold (real alert)
+    # Send "real alerts" (>= min_dark_ratio)
     for cand in best_candidates[:max_alerts]:
         if cand["in_cooldown"] and cand["score"] < 85:
             continue
 
         if cand["dark_ratio"] >= min_dark_ratio:
-            note = "تم إرسال تنبيه لأن المؤشر تجاوز عتبة المرشح."
-            msg = ops_card(cand["area_name"], ksa_time, cand["scene_utc"], cand["lat"], cand["lon"],
-                           cand["dark_ratio"], thr_db, cand["score"], note)
+            msg = ops_card(
+                cand["area_name"], ksa_time, cand["scene_utc"],
+                cand["lat"], cand["lon"],
+                cand["dark_ratio"], thr_db, cand["score"],
+                "تم إرسال تنبيه لأن المؤشر تجاوز عتبة المرشح."
+            )
             send_telegram(bot, chat_id, msg)
             sent_any += 1
             time.sleep(1.2)
 
-            # update state
             area_state.setdefault(cand["area_id"], {})
             area_state[cand["area_id"]]["last_alert_utc"] = iso_z(now)
 
-    # If nothing crossed threshold, send the single best candidate (Analyst mode) once
+    # If no real alerts, send 1 best candidate (Analyst)
     if sent_any == 0 and best_candidates:
         cand = best_candidates[0]
-        note = "مرشح تحليلي (أعلى بقعة داكنة). قد تكون Look-alike وليست زيت."
-        msg = ops_card(cand["area_name"], ksa_time, cand["scene_utc"], cand["lat"], cand["lon"],
-                       cand["dark_ratio"], thr_db, cand["score"], note)
+        msg = ops_card(
+            cand["area_name"], ksa_time, cand["scene_utc"],
+            cand["lat"], cand["lon"],
+            cand["dark_ratio"], thr_db, cand["score"],
+            "مرشح تحليلي (أعلى بقعة داكنة). قد تكون Look-alike وليست زيت."
+        )
         send_telegram(bot, chat_id, msg)
 
-    # If no candidates at all, send a simple status
     if not best_candidates:
         send_telegram(bot, chat_id, status_report(ksa_time, lookback))
 
-    # save
     state["areas"] = area_state
     save_state(state)
 
