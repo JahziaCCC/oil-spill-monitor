@@ -1,7 +1,5 @@
-# --- نفس imports عندك ---
 import os
 import json
-import math
 import datetime as dt
 import requests
 import numpy as np
@@ -9,11 +7,13 @@ from PIL import Image
 from io import BytesIO
 from collections import defaultdict, deque
 
+# ========= Secrets (GitHub Actions) =========
 BOT = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-USERNAME = os.environ["CDSE_USERNAME"]
+USERNAME = os.environ["CDSE_USERNAME"]     # الإيميل الكامل
 PASSWORD = os.environ["CDSE_PASSWORD"]
 
+# ========= Config =========
 STATE_FILE = "cdse_sar_state.json"
 KSA_TZ = dt.timezone(dt.timedelta(hours=3))
 
@@ -29,16 +29,18 @@ REGIONS = [
     {"name_ar": "الخليج العربي", "bbox": [47.0, 23.0, 56.8, 30.8]},
 ]
 
+# Executive output
 TOP_N = 3
 MIN_CANDIDATE_SCORE = 35
 SHOW_ALWAYS_TOP_N = True
 
-# ========= NEW FILTERS (التعديل المهم) =========
-DARK_PERCENTILE_GLOBAL = 8          # كان 12 → خففنا الحساسية
-MIN_PIXELS_BLOB = 600               # كان 300 → نرفعها
-MAX_BLOB_AREA_KM2 = 25.0            # أي شيء أكبر غالباً ليس انسكاب
-MAX_BBOX_FILL_RATIO = 0.35          # لو البقعة تعبّي الباتش كثير → wind shadow غالباً
+# ====== B2 Sensitivity / Filters ======
+DARK_PERCENTILE_GLOBAL = 8          # حساسية “الداكن”
+MIN_PIXELS_BLOB = 600               # أقل حجم بكسل للمرشح
+MAX_BLOB_AREA_KM2 = 25.0            # استبعاد البقع الضخمة جداً
+MAX_BBOX_FILL_RATIO = 0.35          # استبعاد البقع اللي تعبّي الباتش (wind shadow غالباً)
 
+# ========= Coverage Score (0..100) =========
 def recency_points(hours):
     if hours <= 24: return 40
     if hours <= 48: return 30
@@ -65,6 +67,38 @@ def score_label(score):
     if score >= 40: return "🟠 متوسط"
     return "🔴 ضعيف"
 
+# ========= Formatting helpers =========
+AR_WEEKDAYS = {
+    0: "الاثنين",
+    1: "الثلاثاء",
+    2: "الأربعاء",
+    3: "الخميس",
+    4: "الجمعة",
+    5: "السبت",
+    6: "الأحد",
+}
+
+def now_ksa():
+    return dt.datetime.now(KSA_TZ)
+
+def header_datetime_line():
+    t = now_ksa()
+    day = AR_WEEKDAYS.get(t.weekday(), "")
+    return f"🕒 {day} | {t.strftime('%Y-%m-%d')} | {t.strftime('%H:%M')} KSA"
+
+def fmt_dt(iso: str) -> str:
+    try:
+        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(KSA_TZ)
+        return t.strftime("%Y-%m-%d %H:%M KSA")
+    except Exception:
+        return iso
+
+def safe_preview(text: str, n: int = 300) -> str:
+    if text is None:
+        return ""
+    return text.replace("\n", " ").replace("\r", " ")[:n]
+
+# ========= State =========
 def load_state():
     if not os.path.exists(STATE_FILE):
         return {"seen_ids": [], "last_seen_dt_utc": None}
@@ -81,24 +115,14 @@ def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+# ========= Telegram =========
 def telegram_send(text: str):
     url = f"https://api.telegram.org/bot{BOT}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": text, "disable_web_page_preview": False}
     r = requests.post(url, json=payload, timeout=60)
     r.raise_for_status()
 
-def fmt_dt(iso: str) -> str:
-    try:
-        t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(KSA_TZ)
-        return t.strftime("%Y-%m-%d %H:%M KSA")
-    except Exception:
-        return iso
-
-def safe_preview(text: str, n: int = 300) -> str:
-    if text is None:
-        return ""
-    return text.replace("\n", " ").replace("\r", " ")[:n]
-
+# ========= Time =========
 def iso_to_dt_utc(iso: str):
     try:
         t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
@@ -115,8 +139,14 @@ def hours_since(iso_utc: str, now_utc: dt.datetime) -> float:
     d = now_utc - t
     return max(0.0, d.total_seconds() / 3600.0)
 
+# ========= Auth =========
 def get_access_token() -> str:
-    payload = {"client_id": "cdse-public", "grant_type": "password", "username": USERNAME, "password": PASSWORD}
+    payload = {
+        "client_id": "cdse-public",
+        "grant_type": "password",
+        "username": USERNAME,
+        "password": PASSWORD,
+    }
     r = requests.post(TOKEN_URL, data=payload, timeout=60)
     if r.status_code != 200:
         print("CDSE TOKEN STATUS:", r.status_code)
@@ -127,6 +157,7 @@ def get_access_token() -> str:
         raise RuntimeError("Token response missing access_token.")
     return data["access_token"]
 
+# ========= STAC Search =========
 def stac_search(token: str, bbox, start_utc: str, end_utc: str):
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     body = {
@@ -135,10 +166,14 @@ def stac_search(token: str, bbox, start_utc: str, end_utc: str):
         "datetime": f"{start_utc}/{end_utc}",
         "limit": LIMIT_PER_REGION,
         "sortby": [{"field": "properties.datetime", "direction": "desc"}],
-        "fields": {"include": ["id","properties.datetime","properties.platform","properties.sat:orbit_state",
-                              "properties.sat:relative_orbit","properties.sar:instrument_mode",
-                              "properties.sar:polarizations","assets","links"],
-                   "exclude": ["geometry"]},
+        "fields": {
+            "include": [
+                "id",
+                "properties.datetime",
+                "assets",
+            ],
+            "exclude": ["geometry"],
+        },
     }
     r = requests.post(STAC_SEARCH_URL, headers=headers, json=body, timeout=120)
     r.raise_for_status()
@@ -156,21 +191,16 @@ def get_latest_scene_datetime_utc(token: str):
             latest = dtu
     return latest
 
-def pick_preview_and_stac(item: dict):
+def pick_preview(item: dict):
     assets = item.get("assets", {}) or {}
-    links = item.get("links", []) or []
     preview = None
     for k in ["thumbnail", "quicklook", "preview"]:
         if k in assets and isinstance(assets[k], dict) and assets[k].get("href"):
             preview = assets[k]["href"]
             break
-    stac = None
-    for l in links:
-        if l.get("rel") == "self" and l.get("href"):
-            stac = l["href"]
-            break
-    return preview, stac
+    return preview
 
+# ========= Grouping (passes) =========
 def round_time_to_minute(iso: str) -> str:
     try:
         t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00"))
@@ -182,37 +212,31 @@ def round_time_to_minute(iso: str) -> str:
 def make_group_key(item: dict) -> str:
     props = item.get("properties", {}) or {}
     region = item.get("_region_ar", "")
-    platform = props.get("platform", "n/a")
-    orbit = props.get("sat:orbit_state", "n/a")
-    rel_orbit = props.get("sat:relative_orbit", "n/a")
-    mode = props.get("sar:instrument_mode", "n/a")
-    pol = str(props.get("sar:polarizations", "n/a"))
     t_round = round_time_to_minute(props.get("datetime", ""))
-    return f"{region}|{platform}|{t_round}|{orbit}|{rel_orbit}|{mode}|{pol}"
+    # نجمع بشكل محافظ (الوقت بالدقيقة + المنطقة)
+    return f"{region}|{t_round}"
 
 def summarize_groups(groups: dict):
     rows = []
     for _, items in groups.items():
-        items_sorted = sorted(items, key=lambda it: (it.get("properties", {}) or {}).get("datetime", ""), reverse=True)
+        items_sorted = sorted(
+            items,
+            key=lambda it: (it.get("properties", {}) or {}).get("datetime", ""),
+            reverse=True,
+        )
         rep = items_sorted[0]
         props = rep.get("properties", {}) or {}
-        preview, stac = pick_preview_and_stac(rep)
+        preview = pick_preview(rep)
         rows.append({
             "region": rep.get("_region_ar", ""),
             "when": props.get("datetime", ""),
-            "platform": props.get("platform", "n/a"),
-            "orbit": props.get("sat:orbit_state", "n/a"),
-            "rel_orbit": props.get("sat:relative_orbit", "n/a"),
-            "mode": props.get("sar:instrument_mode", "n/a"),
-            "pol": props.get("sar:polarizations", "n/a"),
-            "count": len(items),
             "preview": preview,
-            "stac": stac,
+            "count": len(items),
         })
     rows.sort(key=lambda r: r["when"], reverse=True)
     return rows
 
-# ========= B2 Analysis =========
+# ========= B2: Smart Preview Analysis =========
 def download_preview_to_gray(preview_url: str, max_size=900):
     if not preview_url:
         return None
@@ -221,8 +245,8 @@ def download_preview_to_gray(preview_url: str, max_size=900):
     img = Image.open(BytesIO(r.content)).convert("L")
     w, h = img.size
     if max(w, h) > max_size:
-        scale = max_size / max(w, h)
-        img = img.resize((int(w*scale), int(h*scale)))
+        scale = max_size / max(w * 1.0, h * 1.0)
+        img = img.resize((int(w * scale), int(h * scale)))
     return np.array(img, dtype=np.uint8)
 
 def connected_components(mask: np.ndarray, min_pixels=600):
@@ -256,10 +280,8 @@ def connected_components(mask: np.ndarray, min_pixels=600):
 
 def estimate_km2(area_px: int, img_shape):
     h, w = img_shape
-    frac = area_px / max(1, (h*w))
-    # خفّضنا تحويل المساحة بشكل كبير عشان يصير واقعي في الإنذار الأولي
-    # افترض "مساحة مرجعية" ~ 600 كم² بدلاً من 2500
-    return frac * 600.0
+    frac = area_px / max(1, (h * w))
+    return frac * 600.0  # تقدير تشغيلي (تقريبي)
 
 def oil_likeness_score(gray: np.ndarray, bbox):
     minx, miny, maxx, maxy = bbox
@@ -267,7 +289,6 @@ def oil_likeness_score(gray: np.ndarray, bbox):
     if patch.size == 0:
         return 0, None
 
-    # threshold محلي أضيق (darkest 10% داخل patch)
     thr = np.percentile(patch, 10)
     local_mask = patch <= thr
     area = float(local_mask.sum())
@@ -282,12 +303,10 @@ def oil_likeness_score(gray: np.ndarray, bbox):
     height = (maxy - miny + 1)
     ar = max(width, height) / max(1.0, min(width, height))
 
-    # bbox fill ratio: لو البقعة تعبّي مساحة كبيرة من البوكس -> غالباً ظاهرة واسعة
     bbox_area = float(width * height)
     fill = area / max(1.0, bbox_area)
 
-    # scoring أكثر تحفظاً
-    c_score = min(35.0, (contrast / 50.0) * 35.0)     # سقف أقل
+    c_score = min(35.0, (contrast / 50.0) * 35.0)
     if ar < 1.5:
         e_score = 6.0
     elif ar < 2.5:
@@ -297,7 +316,6 @@ def oil_likeness_score(gray: np.ndarray, bbox):
     else:
         e_score = 32.0
 
-    # penalty لو fill عالي
     if fill > 0.45:
         f_pen = 18.0
     elif fill > 0.30:
@@ -306,7 +324,6 @@ def oil_likeness_score(gray: np.ndarray, bbox):
         f_pen = 0.0
 
     score = int(max(0.0, min(100.0, c_score + e_score + 25.0 - f_pen)))
-
     details = {"contrast": round(contrast, 1), "elongation": round(ar, 2), "fill": round(fill, 2)}
     return score, details
 
@@ -330,13 +347,12 @@ def analyze_pass_preview(preview_url: str):
 
         area_km2 = estimate_km2(b["area_px"], gray.shape)
 
-        # ====== Filters to reduce false positives ======
         if area_km2 > MAX_BLOB_AREA_KM2:
             continue
         if det["fill"] > MAX_BBOX_FILL_RATIO:
             continue
 
-        shape = "Oil-like" if (det["elongation"] >= 2.0 and det["contrast"] >= 10) else "غير منتظم/طبيعي محتمل"
+        shape = "Oil-like" if (det["elongation"] >= 2.2 and det["contrast"] >= 10) else "غير منتظم/طبيعي محتمل"
 
         cand = {
             "score": score,
@@ -350,16 +366,30 @@ def analyze_pass_preview(preview_url: str):
 
     return best
 
-def risk_label(score: int):
-    if score >= 70: return "🔴 HIGH RISK"
-    if score >= 50: return "🟠 MEDIUM RISK"
+# ========= Risk logic =========
+def risk_label(score: int, shape: str):
+    if shape != "Oil-like":
+        if score >= 65:
+            return "🟠 MEDIUM RISK"
+        return "🟡 LOW RISK"
+    if score >= 70:
+        return "🔴 HIGH RISK"
+    if score >= 50:
+        return "🟠 MEDIUM RISK"
     return "🟡 LOW RISK"
 
-def recommendation(score: int):
-    if score >= 70: return "مراقبة فورية"
-    if score >= 50: return "متابعة"
+def recommendation(score: int, shape: str):
+    if shape != "Oil-like":
+        if score >= 65:
+            return "متابعة (مرشح ضعيف/طبيعي محتمل)"
+        return "مراقبة فقط"
+    if score >= 70:
+        return "مراقبة فورية"
+    if score >= 50:
+        return "متابعة"
     return "مراقبة فقط"
 
+# ========= Main =========
 def main():
     state = load_state()
     seen = set(state.get("seen_ids", []))
@@ -381,39 +411,47 @@ def main():
             it["_region_ar"] = region["name_ar"]
             new_items.append(it)
 
+    # ========= No new scenes =========
     if not new_items:
         latest_dt_utc = get_latest_scene_datetime_utc(token) or state.get("last_seen_dt_utc")
         latest_line = f"🛰️ آخر مرور/مشهد معروف: {fmt_dt(latest_dt_utc)}" if latest_dt_utc else ""
-        telegram_send(
-            "🚨🛢️ تقرير انسكابات SAR الذكي (Executive)\n"
-            f"🕒 {dt.datetime.now(KSA_TZ).strftime('%H:%M KSA')}\n"
-            "════════════════════\n"
-            f"✅ لا توجد *مشاهد SAR جديدة* خلال آخر {LOOKBACK_HOURS} ساعة.\n"
-            + (latest_line + "\n" if latest_line else "")
-            + "ℹ️ الكشف الذكي يعتمد على تحليل Preview (إنذار أولي).\n"
-        )
+
+        lines = []
+        lines.append("🚨🛢️ تقرير رصد الانسكابات الزيتيه (تنفيذي)")
+        lines.append(header_datetime_line())
+        lines.append("════════════════════")
+        lines.append(f"✅ لا توجد *مشاهد SAR جديدة* خلال آخر {LOOKBACK_HOURS} ساعة.")
+        if latest_line:
+            lines.append(latest_line)
+        lines.append("ℹ️ الكشف الذكي يعتمد على تحليل صورة الرصد (إنذار أولي).")
+        telegram_send("\n".join(lines))
         return
 
+    # newest time
     new_items.sort(key=lambda it: (it.get("properties", {}) or {}).get("datetime", ""), reverse=True)
     newest_dt_utc = (new_items[0].get("properties", {}) or {}).get("datetime")
     if newest_dt_utc:
         state["last_seen_dt_utc"] = newest_dt_utc
 
+    # group into passes
     groups = defaultdict(list)
     for it in new_items:
         groups[make_group_key(it)].append(it)
     grouped_rows = summarize_groups(groups)
 
+    # region scene counts
     region_counts = defaultdict(int)
     for r in grouped_rows:
         region_counts[r["region"]] += r["count"]
     red_sea_count = region_counts.get("البحر الأحمر", 0)
     gulf_count = region_counts.get("الخليج العربي", 0)
 
+    # coverage score
     h = hours_since(newest_dt_utc, now_utc) if newest_dt_utc else 9999.0
     coverage = recency_points(h) + pass_points(len(grouped_rows)) + balance_points(red_sea_count, gulf_count)
     cov_label = score_label(coverage)
 
+    # ===== B2 Analysis per pass =====
     candidates = []
     for r in grouped_rows:
         if not r.get("preview"):
@@ -426,14 +464,12 @@ def main():
                 "region": r["region"],
                 "when": r["when"],
                 "preview": r["preview"],
-                "stac": r["stac"],
                 **res
             })
         except Exception as e:
             print("Preview analysis failed:", str(e)[:200])
             continue
 
-    # المرشحات = اللي فوق الحد الأدنى
     cand_count = sum(1 for c in candidates if c["score"] >= MIN_CANDIDATE_SCORE)
     candidates.sort(key=lambda c: (c["score"], c["when"]), reverse=True)
 
@@ -441,17 +477,18 @@ def main():
     if not top and candidates and SHOW_ALWAYS_TOP_N:
         top = candidates[:TOP_N]
 
-    likely_spill = sum(1 for c in top if c["score"] >= 70)
-    need_follow = sum(1 for c in top if 50 <= c["score"] < 70)
-    natural = sum(1 for c in top if c["score"] < 50)
+    # Executive summary counts (by shape)
+    likely_spill = sum(1 for c in top if (c["score"] >= 70 and c["shape"] == "Oil-like"))
+    need_follow  = sum(1 for c in top if (50 <= c["score"] < 70 and c["shape"] == "Oil-like"))
+    natural      = max(0, len(top) - likely_spill - need_follow)
 
+    # ===== Build message =====
     lines = []
-    lines.append("🚨🛢️ تقرير انسكابات SAR الذكي (Executive)")
-    lines.append(f"🕒 {dt.datetime.now(KSA_TZ).strftime('%H:%M KSA')}")
+    lines.append("🚨🛢️ تقرير رصد الانسكابات الزيتيه (تنفيذي)")
+    lines.append(header_datetime_line())
     lines.append("════════════════════")
     lines.append(f"📊 مؤشر التغطية: {coverage}/100 — {cov_label}")
     lines.append(f"🧠 عدد المرشحات: {cand_count}")
-    lines.append(f"🎯 المعروض: أعلى {TOP_N} فقط")
     lines.append("════════════════════")
 
     if not top:
@@ -459,8 +496,9 @@ def main():
         lines.append("ℹ️ هذا طبيعي — كثير من البقع الداكنة تكون ظواهر سطحية (رياح هادئة/أمواج داخلية).")
     else:
         for c in top:
-            label = risk_label(c["score"])
-            rec = recommendation(c["score"])
+            label = risk_label(c["score"], c["shape"])
+            rec = recommendation(c["score"], c["shape"])
+
             lines.append(f"{label} — {c['region']}")
             lines.append(f"• الثقة: {c['score']}%")
             lines.append(f"• المساحة: {c['area_km2']} كم² (تقريبية)")
@@ -469,9 +507,7 @@ def main():
             lines.append(f"• التباين: {c['contrast']}")
             lines.append(f"• التوصية: {rec}")
             lines.append("")
-            lines.append(f"Preview: {c['preview']}")
-            if c.get("stac"):
-                lines.append(f"STAC: {c['stac']}")
+            lines.append(f"🖼️ صورة الرصد: {c['preview']}")
             lines.append("════════════════════")
 
         lines.append("📌 الملخص التنفيذي:")
@@ -481,6 +517,7 @@ def main():
 
     telegram_send("\n".join(lines))
 
+    # Save state
     for it in new_items:
         _id = it.get("id")
         if _id:
