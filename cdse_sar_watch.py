@@ -3,7 +3,7 @@ import json
 import datetime as dt
 import requests
 
-# ========= Secrets (من GitHub Actions) =========
+# ========= Secrets (GitHub Actions) =========
 BOT = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 USERNAME = os.environ["CDSE_USERNAME"]     # لازم يكون الإيميل الكامل
@@ -17,24 +17,29 @@ TOKEN_URL = "https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/
 STAC_SEARCH_URL = "https://stac.dataspace.copernicus.eu/v1/search"
 COLLECTION = "sentinel-1-grd"   # Sentinel-1 GRD in CDSE STAC
 
-LOOKBACK_HOURS = 24
+LOOKBACK_HOURS = 72             # ✅ عدلناها إلى 72 ساعة
 LIMIT_PER_REGION = 50
 
 # البحر الأحمر + الخليج العربي (BBox)
 REGIONS = [
-    {"name_ar": "البحر الأحمر",   "bbox": [32.0, 12.0, 44.5, 30.5]},
-    {"name_ar": "الخليج العربي",  "bbox": [47.0, 23.0, 56.8, 30.8]},
+    {"name_ar": "البحر الأحمر",  "bbox": [32.0, 12.0, 44.5, 30.5]},
+    {"name_ar": "الخليج العربي", "bbox": [47.0, 23.0, 56.8, 30.8]},
 ]
 
 # ========= Helpers =========
 def load_state():
     if not os.path.exists(STATE_FILE):
-        return {"seen_ids": []}
+        return {"seen_ids": [], "last_seen_dt_utc": None}
     try:
         with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+            s = json.load(f)
+            if "seen_ids" not in s:
+                s["seen_ids"] = []
+            if "last_seen_dt_utc" not in s:
+                s["last_seen_dt_utc"] = None
+            return s
     except Exception:
-        return {"seen_ids": []}
+        return {"seen_ids": [], "last_seen_dt_utc": None}
 
 def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
@@ -51,6 +56,7 @@ def telegram_send(text: str):
     r.raise_for_status()
 
 def fmt_dt(iso: str) -> str:
+    # iso like 2026-03-01T01:27:00Z
     try:
         t = dt.datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(KSA_TZ)
         return t.strftime("%Y-%m-%d %H:%M KSA")
@@ -81,12 +87,14 @@ def pick_links(item: dict):
 
     return self_link, alt_link, thumb
 
+def safe_preview(text: str, n: int = 300) -> str:
+    if text is None:
+        return ""
+    text = text.replace("\n", " ").replace("\r", " ")
+    return text[:n]
+
 # ========= CDSE Auth =========
 def get_access_token() -> str:
-    """
-    يستخدم OAuth password grant مع client_id=cdse-public.
-    عند الفشل نطبع سبب الخطأ (مثل invalid_grant) بدون أي بيانات حساسة.
-    """
     payload = {
         "client_id": "cdse-public",
         "grant_type": "password",
@@ -96,15 +104,15 @@ def get_access_token() -> str:
 
     r = requests.post(TOKEN_URL, data=payload, timeout=60)
 
-    # تشخيص آمن: نطبع فقط الحالة + بداية الرد (غالباً خطأ invalid_grant)
     if r.status_code != 200:
+        # تشخيص آمن: نطبع فقط سبب الرفض بدون أي أسرار
         print("CDSE TOKEN STATUS:", r.status_code)
-        print("CDSE TOKEN BODY (first 300 chars):", r.text[:300])
+        print("CDSE TOKEN BODY (first 300 chars):", safe_preview(r.text, 300))
         r.raise_for_status()
 
     data = r.json()
     if "access_token" not in data:
-        raise RuntimeError(f"Token response missing access_token. Body: {str(data)[:300]}")
+        raise RuntimeError("Token response missing access_token.")
     return data["access_token"]
 
 # ========= STAC Search =========
@@ -138,6 +146,27 @@ def stac_search(token: str, bbox, start_utc: str, end_utc: str):
     r.raise_for_status()
     return r.json().get("features", [])
 
+def get_latest_scene_datetime_utc(token: str):
+    """
+    يجيب أحدث مشهد (بدون فلترة زمنية) لكل منطقة — فقط لعرض "آخر مرور معروف"
+    """
+    latest = None
+    for region in REGIONS:
+        feats = stac_search(
+            token=token,
+            bbox=region["bbox"],
+            start_utc="1970-01-01T00:00:00Z",
+            end_utc=dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        if not feats:
+            continue
+        dt_utc = (feats[0].get("properties", {}) or {}).get("datetime")
+        if not dt_utc:
+            continue
+        if latest is None or dt_utc > latest:
+            latest = dt_utc
+    return latest
+
 # ========= Main =========
 def main():
     state = load_state()
@@ -163,23 +192,37 @@ def main():
 
     # لا جديد
     if not new_items:
+        # جيب "آخر مرور معروف" (الأحدث) وعرضه
+        latest_dt_utc = get_latest_scene_datetime_utc(token) or state.get("last_seen_dt_utc")
+        latest_line = ""
+        if latest_dt_utc:
+            latest_line = f"🛰️ آخر مرور/مشهد معروف: {fmt_dt(latest_dt_utc)}"
+
         telegram_send(
             "🛢️📡 رصد الانسكابات (SAR)\n"
             f"🕒 {dt.datetime.now(KSA_TZ).strftime('%Y-%m-%d %H:%M KSA')}\n"
             "════════════════════\n"
-            "✅ لا توجد *مشاهد SAR جديدة* خلال آخر 24 ساعة فوق البحر الأحمر والخليج العربي.\n"
-            "ℹ️ هذا رصد تغطية SAR (مصدر خام) — كشف الانسكاب الفعلي يتم بتحليل الصورة.\n"
+            f"✅ لا توجد *مشاهد SAR جديدة* خلال آخر {LOOKBACK_HOURS} ساعة فوق البحر الأحمر والخليج العربي.\n"
+            + (f"{latest_line}\n" if latest_line else "")
+            + "ℹ️ هذا رصد تغطية SAR (مصدر خام) — كشف الانسكاب الفعلي يتم بتحليل الصورة.\n"
         )
         return
 
     # ترتيب الأحدث
     new_items.sort(key=lambda it: it.get("properties", {}).get("datetime", ""), reverse=True)
 
+    # تحديث آخر مرّة (UTC)
+    newest_dt_utc = (new_items[0].get("properties", {}) or {}).get("datetime")
+    if newest_dt_utc:
+        state["last_seen_dt_utc"] = newest_dt_utc
+
     lines = []
     lines.append("🛢️📡 رصد الانسكابات (SAR) — تغطية البحر الأحمر + الخليج العربي")
     lines.append(f"🕒 {dt.datetime.now(KSA_TZ).strftime('%Y-%m-%d %H:%M KSA')}")
     lines.append("════════════════════")
     lines.append(f"✅ تم رصد {len(new_items)} مشهد/مشاهد SAR جديدة خلال آخر {LOOKBACK_HOURS} ساعة.")
+    if newest_dt_utc:
+        lines.append(f"🛰️ أحدث مشهد: {fmt_dt(newest_dt_utc)}")
     lines.append("ℹ️ هذه *مشاهد خام* جاهزة للتحليل (احتمالات انسكاب تُؤكَّد بالتحليل).")
     lines.append("════════════════════")
 
