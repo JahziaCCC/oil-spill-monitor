@@ -507,7 +507,7 @@ def main():
 
         lines.append("الملخص:")
         lines.append(f"• انسكاب محتمل: {likely_spill}")
-        lines.append(f"• يحتاج متابعة: {need_follow}")
+        lines.append(f"\u200F• يحتاج متابعة: {need_follow}")
 
     telegram_send("\n".join(lines))
 
