@@ -2,7 +2,7 @@ name: CDSE SAR Watch (Red Sea + Arabian Gulf)
 
 on:
   schedule:
-    - cron: "15 * * * *"   # كل ساعة عند الدقيقة 15
+    - cron: "15 * * * *"   # كل ساعة
   workflow_dispatch:
 
 jobs:
