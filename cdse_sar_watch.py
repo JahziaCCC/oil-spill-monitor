@@ -505,10 +505,9 @@ def main():
             lines.append(f"🖼️ صورة الرصد: {c['preview']}")
             lines.append("════════════════════")
 
-        lines.append("📌 الملخص التنفيذي:")
+        lines.append("الملخص:")
         lines.append(f"• انسكاب محتمل: {likely_spill}")
         lines.append(f"• يحتاج متابعة: {need_follow}")
-        lines.append(f"• طبيعي غالباً: {natural}")
 
     telegram_send("\n".join(lines))
 
