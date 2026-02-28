@@ -29,16 +29,16 @@ REGIONS = [
     {"name_ar": "الخليج العربي", "bbox": [47.0, 23.0, 56.8, 30.8]},
 ]
 
-# Executive output
+# Output
 TOP_N = 3
 MIN_CANDIDATE_SCORE = 35
 SHOW_ALWAYS_TOP_N = True
 
 # ====== B2 Sensitivity / Filters ======
-DARK_PERCENTILE_GLOBAL = 8          # حساسية “الداكن”
-MIN_PIXELS_BLOB = 600               # أقل حجم بكسل للمرشح
-MAX_BLOB_AREA_KM2 = 25.0            # استبعاد البقع الضخمة جداً
-MAX_BBOX_FILL_RATIO = 0.35          # استبعاد البقع اللي تعبّي الباتش (wind shadow غالباً)
+DARK_PERCENTILE_GLOBAL = 8
+MIN_PIXELS_BLOB = 600
+MAX_BLOB_AREA_KM2 = 25.0
+MAX_BBOX_FILL_RATIO = 0.35
 
 # ========= Coverage Score (0..100) =========
 def recency_points(hours):
@@ -167,11 +167,7 @@ def stac_search(token: str, bbox, start_utc: str, end_utc: str):
         "limit": LIMIT_PER_REGION,
         "sortby": [{"field": "properties.datetime", "direction": "desc"}],
         "fields": {
-            "include": [
-                "id",
-                "properties.datetime",
-                "assets",
-            ],
+            "include": ["id", "properties.datetime", "assets"],
             "exclude": ["geometry"],
         },
     }
@@ -193,12 +189,10 @@ def get_latest_scene_datetime_utc(token: str):
 
 def pick_preview(item: dict):
     assets = item.get("assets", {}) or {}
-    preview = None
     for k in ["thumbnail", "quicklook", "preview"]:
         if k in assets and isinstance(assets[k], dict) and assets[k].get("href"):
-            preview = assets[k]["href"]
-            break
-    return preview
+            return assets[k]["href"]
+    return None
 
 # ========= Grouping (passes) =========
 def round_time_to_minute(iso: str) -> str:
@@ -213,7 +207,6 @@ def make_group_key(item: dict) -> str:
     props = item.get("properties", {}) or {}
     region = item.get("_region_ar", "")
     t_round = round_time_to_minute(props.get("datetime", ""))
-    # نجمع بشكل محافظ (الوقت بالدقيقة + المنطقة)
     return f"{region}|{t_round}"
 
 def summarize_groups(groups: dict):
@@ -368,6 +361,7 @@ def analyze_pass_preview(preview_url: str):
 
 # ========= Risk logic =========
 def risk_label(score: int, shape: str):
+    # لا نسمح HIGH إذا مو Oil-like
     if shape != "Oil-like":
         if score >= 65:
             return "🟠 MEDIUM RISK"
@@ -379,9 +373,10 @@ def risk_label(score: int, shape: str):
     return "🟡 LOW RISK"
 
 def recommendation(score: int, shape: str):
+    # بدل "مرشح ضعيف" -> "غالباً طبيعي"
     if shape != "Oil-like":
         if score >= 65:
-            return "متابعة (مرشح ضعيف/طبيعي محتمل)"
+            return "متابعة (غالباً طبيعي)"
         return "مراقبة فقط"
     if score >= 70:
         return "مراقبة فورية"
@@ -417,7 +412,7 @@ def main():
         latest_line = f"🛰️ آخر مرور/مشهد معروف: {fmt_dt(latest_dt_utc)}" if latest_dt_utc else ""
 
         lines = []
-        lines.append("🚨🛢️ تقرير رصد الانسكابات الزيتيه (تنفيذي)")
+        lines.append("🚨🛢️ تقرير رصد الانسكابات الزيتيه")
         lines.append(header_datetime_line())
         lines.append("════════════════════")
         lines.append(f"✅ لا توجد *مشاهد SAR جديدة* خلال آخر {LOOKBACK_HOURS} ساعة.")
@@ -451,7 +446,7 @@ def main():
     coverage = recency_points(h) + pass_points(len(grouped_rows)) + balance_points(red_sea_count, gulf_count)
     cov_label = score_label(coverage)
 
-    # ===== B2 Analysis per pass =====
+    # ===== Analysis per pass =====
     candidates = []
     for r in grouped_rows:
         if not r.get("preview"):
@@ -484,7 +479,7 @@ def main():
 
     # ===== Build message =====
     lines = []
-    lines.append("🚨🛢️ تقرير رصد الانسكابات الزيتيه (تنفيذي)")
+    lines.append("🚨🛢️ تقرير رصد الانسكابات الزيتيه")
     lines.append(header_datetime_line())
     lines.append("════════════════════")
     lines.append(f"📊 مؤشر التغطية: {coverage}/100 — {cov_label}")
