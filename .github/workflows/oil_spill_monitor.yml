@@ -3,8 +3,7 @@ name: Oil Spill Monitor
 on:
   workflow_dispatch:
   schedule:
-    # كل 30 دقيقة (عدّلها حسب رغبتك)
-    - cron: "*/30 * * * *"
+    - cron: "*/30 * * * *"  # كل 30 دقيقة (تقدر تغيرها)
 
 jobs:
   run-monitor:
@@ -25,19 +24,18 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install requests python-dateutil
 
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # لو عندك مفاتيح/أسرار إضافية أضفها هنا مثل:
+          # لو عندك أسرار أخرى أضفها هنا:
           # CREODIAS_USERNAME: ${{ secrets.CREODIAS_USERNAME }}
           # CREODIAS_PASSWORD: ${{ secrets.CREODIAS_PASSWORD }}
         run: |
           python oil_spill_monitor.py
 
-      # (اختياري) إذا سكربتك ينتج state.json وتبي تحفظه في الريبو:
       - name: Commit state.json (if changed)
         run: |
           if [ -f state.json ]; then
