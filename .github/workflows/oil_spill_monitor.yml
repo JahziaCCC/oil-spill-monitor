@@ -3,7 +3,7 @@ name: Oil Spill Monitor
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"  # كل 30 دقيقة (تقدر تغيرها)
+    - cron: "*/30 * * * *"
 
 jobs:
   run-monitor:
@@ -24,15 +24,12 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests python-dateutil
+          pip install requests python-dateutil numpy pandas scipy
 
       - name: Run monitor
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          # لو عندك أسرار أخرى أضفها هنا:
-          # CREODIAS_USERNAME: ${{ secrets.CREODIAS_USERNAME }}
-          # CREODIAS_PASSWORD: ${{ secrets.CREODIAS_PASSWORD }}
         run: |
           python oil_spill_monitor.py
 
